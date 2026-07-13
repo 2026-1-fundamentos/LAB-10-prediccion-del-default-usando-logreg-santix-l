@@ -95,3 +95,103 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import json, gzip, pickle, os
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import precision_score, balanced_accuracy_score, recall_score, f1_score, confusion_matrix
+
+CATEGORICAS = ["SEX", "EDUCATION", "MARRIAGE"]
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUTA_TRAIN = os.path.join(RAIZ, "files", "input", "train_data.csv.zip")
+RUTA_TEST = os.path.join(RAIZ, "files", "input", "test_data.csv.zip")
+RUTA_MODELO = os.path.join(RAIZ, "files", "models", "model.pkl.gz")
+RUTA_METRICAS = os.path.join(RAIZ, "files", "output", "metrics.json")
+
+
+def limpiar(df):
+    """Limpia el dataset segun las reglas del enunciado."""
+    df = df.rename(columns={"default payment next month": "default"}).drop(columns=["ID"]).dropna()
+    df = df[(df["EDUCATION"] != 0) & (df["MARRIAGE"] != 0)]
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda v: 4 if v > 4 else v)
+    return df
+
+
+def cargar_datos():
+    """Carga y limpia train y test."""
+    train = limpiar(pd.read_csv(RUTA_TRAIN, index_col=False, compression="zip"))
+    test = limpiar(pd.read_csv(RUTA_TEST, index_col=False, compression="zip"))
+    return train.drop(columns=["default"]), train["default"], test.drop(columns=["default"]), test["default"]
+
+
+def crear_modelo(x_train, y_train):
+    """Construye el pipeline y optimiza sus hiperparametros con GridSearchCV."""
+    numericas = [c for c in x_train.columns if c not in CATEGORICAS]
+    pipeline = Pipeline([
+        ("preprocesador", ColumnTransformer([
+            ("cat", OneHotEncoder(handle_unknown="ignore"), CATEGORICAS),
+            ("num", MinMaxScaler(), numericas),
+        ])),
+        ("selector", SelectKBest(score_func=f_classif)),
+        ("clasificador", LogisticRegression(max_iter=1000, random_state=42)),
+    ])
+    grilla = {
+        "selector__k": list(range(1, 24)),
+        "clasificador__C": [0.001, 0.01, 0.1, 1, 10, 100, 1000],
+        "clasificador__solver": ["liblinear"],
+    }
+    modelo = GridSearchCV(pipeline, grilla, cv=10, scoring="balanced_accuracy", n_jobs=-1, refit=True)
+    modelo.fit(x_train, y_train)
+    return modelo
+
+
+def guardar_modelo(modelo):
+    os.makedirs(os.path.dirname(RUTA_MODELO), exist_ok=True)
+    with gzip.open(RUTA_MODELO, "wb") as archivo:
+        pickle.dump(modelo, archivo)
+
+
+def metricas(nombre, y_real, y_pred):
+    return {
+        "type": "metrics", "dataset": nombre,
+        "precision": precision_score(y_real, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_real, y_pred),
+        "recall": recall_score(y_real, y_pred, zero_division=0),
+        "f1_score": f1_score(y_real, y_pred, zero_division=0),
+    }
+
+
+def matriz_confusion(nombre, y_real, y_pred):
+    m = confusion_matrix(y_real, y_pred)
+    return {
+        "type": "cm_matrix", "dataset": nombre,
+        "true_0": {"predicted_0": int(m[0][0]), "predicted_1": int(m[0][1])},
+        "true_1": {"predicted_0": int(m[1][0]), "predicted_1": int(m[1][1])},
+    }
+
+
+def guardar_metricas(modelo, x_train, y_train, x_test, y_test):
+    """Calcula y guarda metricas y matrices de confusion en metrics.json."""
+    os.makedirs(os.path.dirname(RUTA_METRICAS), exist_ok=True)
+    yt_pred, ye_pred = modelo.predict(x_train), modelo.predict(x_test)
+    filas = [
+        metricas("train", y_train, yt_pred), metricas("test", y_test, ye_pred),
+        matriz_confusion("train", y_train, yt_pred), matriz_confusion("test", y_test, ye_pred),
+    ]
+    with open(RUTA_METRICAS, "w") as archivo:
+        archivo.write("\n".join(json.dumps(fila) for fila in filas) + "\n")
+
+
+def main():
+    x_train, y_train, x_test, y_test = cargar_datos()
+    modelo = crear_modelo(x_train, y_train)
+    guardar_modelo(modelo)
+    guardar_metricas(modelo, x_train, y_train, x_test, y_test)
+
+
+main()
